@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+app/instance
+app/__pycache__
+app/models/__pycache__
+app/summary_model/__pycache__
+app/data_sources/__pycache__
 # C extensions
 *.so
 
