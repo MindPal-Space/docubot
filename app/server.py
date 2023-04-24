@@ -47,7 +47,7 @@ async def startup():
     global vector_database
     vector_database =  init_pinecone_index(PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY"),
                                            environment = "us-central1-gcp",
-                                           index_name= "langchain-demo",
+                                           index_name= "docify",
                                            dimension= 1024,
                                            metric="cosine")
     global embedding 
