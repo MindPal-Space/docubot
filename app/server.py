@@ -1,30 +1,32 @@
 import os
 import aiofiles
-import uuid
+import openai
+import re
 
-
-from fastapi import FastAPI, UploadFile, Form, File, BackgroundTasks, Path
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, Form, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Depends, Response, status
-from fastapi.security import HTTPBearer
 
-from model.api import summary_response, document_id
+from model.api import upload_document_response, chat_response
 from data_source.pdf import extract_text_from_pdf
 from data_source.docx import extract_text_from_docx 
 from data_source.pptx import extract_text_from_pptx 
 from data_source.web import extract_text_from_web 
 from data_source.audio import extract_text_from_audio 
 from data_source.youtube import extract_text_from_youtube
-from summary_model.cohere import cohere_summarize
+from utils.unique_id import generate_uuid 
+from utils.text_splitter import split_text
+from vector_database.pinecone import upload_document, init_pinecone_index, get_context
+from embedding.cohere import init_cohere_embedding
 
 app = FastAPI()
-DEFAULT_CHUNK_SIZE = 1*1024 * 1024   # 1 megabytes
+DEFAULT_CHUNK_SIZE = 2*1024 * 1024   # 1 megabytes
 
 
 uploads_dir = os.path.dirname(os.path.realpath(__file__))
 
 origins = [
-  "https://app.mindpal.io/",
+  "https://chat.mindpal.space/",
   "http://localhost:3000"
 ]
 
@@ -39,113 +41,92 @@ app.add_middleware(
 def remove_file(file_path: str):
     os.remove(file_path)
 
-@app.get("/api/id", response_model = document_id)
-def get_id():
-    
+@app.on_event("startup")
+async def startup():
+    load_dotenv()
+    global vector_database
+    vector_database =  init_pinecone_index(PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY"),
+                                           environment = "us-central1-gcp",
+                                           index_name= "langchain-demo",
+                                           dimension= 1024,
+                                           metric="cosine")
+    global embedding 
+    embedding = init_cohere_embedding(COHERE_API_KEY = os.environ.get("COHERE_API_KEY"))
+    openai.api_key = os.environ.get("OPENAI_API_KEY")
+
+
+
+@app.post("/api/upload-file", response_model = upload_document_response)
+async def upload_file(background_tasks: BackgroundTasks, doc_file: UploadFile = File()):
+
+    document_id = generate_uuid()
     if not os.path.exists("instance"):
-        os.makedirs("instance")
+            os.makedirs("instance")
 
-    id = str(uuid.uuid4())
-    while id in os.listdir("instance"):
-        id = str(uuid.uuid4())
-    
-    return document_id(id = id)
+    file_name =  "instance/" + document_id + "/" + doc_file.filename
 
-
-@app.post("/api/upload-pdf", response_model = summary_response)
-async def upload_pdf(background_tasks: BackgroundTasks, id: str, pdf_file: UploadFile = File()):
-
-    if id in os.listdir("instance"):
-        return {"error": True, "msg": "the id is already exist"}
-    
-    os.mkdir("instance/" + id)
-    file_name = "instance/" + id + "/" + pdf_file.filename
+    os.mkdir("instance/" + document_id)
 
     async with aiofiles.open(file_name, 'wb') as out_file:
-            while chunk := await pdf_file.read(DEFAULT_CHUNK_SIZE):
+            while chunk := await doc_file.read(DEFAULT_CHUNK_SIZE):
                 await out_file.write(chunk)
 
-    pdf_text = extract_text_from_pdf(file_name)
+    extracted_text = extract_text_from_file(file_name)
+    chunks = split_text(extracted_text)
+    print(len(chunks))
+    upload_document(embedding, vector_database, chunks, document_id, batch_size = 64)
 
-    summary = cohere_summarize(pdf_text)
     background_tasks.add_task(remove_file, file_name)
-    return summary_response(bullet_points = summary.split("\n"))
+    return upload_document_response(document_id = document_id)
+
+def extract_text_from_file(file_name: str):
+    file_type = file_name.split(".")[-1]
+    if file_type == "pdf":
+        return extract_text_from_pdf(file_name)
+    elif file_type == "docx":
+        return extract_text_from_docx(file_name)
+    elif file_type == "pptx":
+        return extract_text_from_pptx(file_name)
+    elif file_type == "mp3":
+        return extract_text_from_audio(file_name)
+    elif file_type == "wav":
+        return extract_text_from_audio(file_name)
+    elif file_type == "webm":
+        return extract_text_from_audio(file_name)
+    elif file_type == "mp4":
+        return extract_text_from_audio(file_name)
+
+@app.post("/api/upload-url", response_model = upload_document_response)
+async def upload_url(url: str = Form()):
+
+    document_id = generate_uuid()
+
+    if is_youtube_url(url):
+        extracted_text = extract_text_from_youtube(url)
+    else:
+        extracted_text = extract_text_from_web(url)
+    chunks = split_text(extracted_text)
+    print(len(chunks))
+    upload_document(embedding, vector_database, chunks, document_id, batch_size = 64)
+
+    return upload_document_response(document_id = document_id)
+
+def is_youtube_url(url):
+    youtube_regex = r"(http(s)?:\/\/)?(w{3}\.)?youtu(be\.com|\.be)\/.+"
+    return bool(re.match(youtube_regex, url))
 
 
-@app.post("/api/upload-pptx", response_model = summary_response)
-async def upload_pptx(background_tasks: BackgroundTasks, id: str, pptx_file: UploadFile = File()):
+@app.get("/api/chat", response_model = chat_response)
+async def chat(document_id: str ,
+                user_message: str ):
+    context = get_context(embedding, document_id, vector_database, user_message)
+    messages=[{"role": "system", "content": "you are a helpful assistant"}]
+    user_message = f"given the context: {context}, answer the follwing question: {user_message}"
+    bot_message = chatbot_response(user_message, messages)
+    return chat_response(context = context, bot_message = bot_message)
 
-    if id in os.listdir("instance"):
-        return {"error": True, "msg": "the id is already exist"}
-    
-    os.mkdir("instance/" + id)
-    file_name = "instance/" + id + "/" + pptx_file.filename
-
-    async with aiofiles.open(file_name, 'wb') as out_file:
-            while chunk := await pptx_file.read(DEFAULT_CHUNK_SIZE):
-                await out_file.write(chunk)
-
-    pptx_text = extract_text_from_pptx(file_name)
-
-    summary = cohere_summarize(pptx_text)
-    background_tasks.add_task(remove_file, file_name)
-    return summary_response(bullet_points = summary.split("\n"))
-
-
-@app.post("/api/upload-docx", response_model = summary_response)
-async def upload_docx(background_tasks: BackgroundTasks, id: str, dox_file: UploadFile = File()):
-        
-    if id in os.listdir("instance"):
-        return {"error": True, "msg": "the id is already exist"}
-        
-    os.mkdir("instance/" + id)
-    file_name = "instance/" + id + "/" + dox_file.filename
-    
-    async with aiofiles.open(file_name, 'wb') as out_file:
-            while chunk := await dox_file.read(DEFAULT_CHUNK_SIZE):
-                await out_file.write(chunk)
-    
-    docx_text = extract_text_from_docx(file_name)
-    
-    summary = cohere_summarize(docx_text)
-    background_tasks.add_task(remove_file, file_name)
-    return summary_response(bullet_points = summary.split("\n"))
-
-@app.post("/api/upload-web", response_model = summary_response)
-async def upload_web(url: str = Form(...)):
-          
-    web_text = extract_text_from_web(url)        
-    summary = cohere_summarize(web_text)
-    return summary_response(bullet_points = summary.split("\n"))
-
-@app.post("/api/upload-youtube", response_model = summary_response)
-async def upload_web(url: str = Form(...)):
-          
-    web_text = extract_text_from_youtube(url)        
-    summary = cohere_summarize(web_text)
-    if type(summary) == str:
-        return summary_response(bullet_points = summary.split("\n"))
-    elif type(summary) == list:
-        buller_points = []
-        for s in summary:
-            buller_points += s.split("\n")
-        return summary_response(bullet_points = buller_points)
-
-@app.post("/api/upload-audio", response_model = summary_response)
-async def upload_audio(background_tasks: BackgroundTasks, id: str, audio_file: UploadFile = File()):
-        
-    if id in os.listdir("instance"):
-        return {"error": True, "msg": "the id is already exist"}
-        
-    os.mkdir("instance/" + id)
-    file_name = "instance/" + id + "/" + audio_file.filename
-    
-    async with aiofiles.open(file_name, 'wb') as out_file:
-            while chunk := await audio_file.read(DEFAULT_CHUNK_SIZE):
-                await out_file.write(chunk)
-    
-    audio_text = extract_text_from_audio(file_name)
-    
-    summary = cohere_summarize(audio_text)
-    background_tasks.add_task(remove_file, file_name)
-    return summary_response(bullet_points = summary.split("\n"))
+def chatbot_response(msg, messages):
+    item =  {"role": "user", "content": msg}
+    messages.append(item)
+    response = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=messages, temperature = 0, max_tokens = 100)
+    return str(response['choices'][0]['message']['content'])

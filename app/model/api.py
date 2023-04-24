@@ -1,8 +1,13 @@
 from pydantic import BaseModel
 from typing import List
 
-class summary_response(BaseModel):
-    bullet_points: List[str]
 
-class document_id(BaseModel):
-    id: str
+
+class upload_document_response(BaseModel):
+    document_id: str 
+
+
+class chat_response(BaseModel):
+    context: str 
+    bot_message: str 
+    
